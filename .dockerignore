@@ -1,0 +1,13 @@
+venv/
+.idea/
+__pycache__/
+*.pyc
+models/onnx/
+train.py
+export_onnx.py
+test_api.py
+logs/
+.git/
+mlops/
+mlruns/
+.github/

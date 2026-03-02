@@ -1,0 +1,27 @@
+# Virtual environment
+venv/
+
+# Model artifacts (too large for GitHub, stored in MLflow/S3)
+models/
+
+# MLflow local tracking data (stored in S3 for CI/CD)
+mlruns/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS files
+.DS_Store
+
+# Logs
+logs/
+
+# Environment variables (secrets)
+.env

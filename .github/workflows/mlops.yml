@@ -1,0 +1,168 @@
+name: MLOps Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mlops/**'
+      - 'config.py'
+      - 'data_loader.py'
+      - 'train.py'
+      - 'inference.py'
+      - 'app.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+
+  schedule:
+    # Weekly retraining: Sunday at midnight UTC
+    - cron: '0 0 * * 0'
+
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Pipeline command to run'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - train
+          - evaluate
+          - deploy
+          - status
+
+env:
+  PYTHON_VERSION: '3.9'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPO: ${{ secrets.ECR_REPO }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_TASK_FAMILY: ${{ secrets.ECS_TASK_FAMILY }}
+  ECS_EXECUTION_ROLE_ARN: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+  S3_ARTIFACT_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install linter
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check mlops/ config.py data_loader.py train.py inference.py app.py
+
+  retrain:
+    name: Retrain Model
+    needs: lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.command == 'train')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Run MLflow-tracked training
+        run: python -m mlops.pipeline train
+
+  evaluate:
+    name: Evaluation Gate
+    needs: [lint, retrain]
+    if: always() && needs.lint.result == 'success' && (needs.retrain.result == 'success' || needs.retrain.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Run evaluation gate
+        run: python -m mlops.pipeline evaluate
+
+  deploy:
+    name: Deploy to ECS
+    needs: evaluate
+    if: needs.evaluate.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy
+        run: python -m mlops.pipeline deploy --tag ${{ github.sha }}
+
+  post-deploy:
+    name: Post-Deploy Monitoring
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Wait for service to stabilize
+        run: sleep 60
+
+      - name: Run post-deploy health checks
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: python -m mlops.pipeline monitor --once
