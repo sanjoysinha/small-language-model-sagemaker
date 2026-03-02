@@ -12,6 +12,7 @@ on:
       - 'app.py'
       - 'requirements.txt'
       - 'Dockerfile'
+      - '.github/workflows/**'
 
   schedule:
     # Weekly retraining: Sunday at midnight UTC
