@@ -23,7 +23,6 @@ from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import config
 from data_loader import load_and_preprocess, create_dataloaders
 from train import evaluate as evaluate_model_on_loader
 from mlops.config_mlops import (

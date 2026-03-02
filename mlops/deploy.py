@@ -5,10 +5,8 @@ Downloads the Production model from MLflow registry, builds a Docker image,
 pushes to ECR, and updates the ECS service with a rolling deployment.
 """
 
-import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +14,6 @@ import boto3
 import mlflow
 import mlflow.pytorch
 from loguru import logger
-from transformers import DistilBertTokenizerFast
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

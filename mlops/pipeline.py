@@ -181,7 +181,7 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Pipeline commands")
 
     # train
-    train_parser = subparsers.add_parser("train", help="MLflow-tracked training")
+    subparsers.add_parser("train", help="MLflow-tracked training")
 
     # evaluate
     eval_parser = subparsers.add_parser("evaluate", help="Run evaluation gate")
@@ -204,7 +204,7 @@ Examples:
     monitor_parser.add_argument("--url", type=str, default=None, help="API base URL")
 
     # status
-    status_parser = subparsers.add_parser("status", help="Show registry + ECS status")
+    subparsers.add_parser("status", help="Show registry + ECS status")
 
     args = parser.parse_args()
 
