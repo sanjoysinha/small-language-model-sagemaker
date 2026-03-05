@@ -1,8 +1,8 @@
 """
 Production monitoring.
 
-Checks ECS service health, API endpoint health, runs smoke tests,
-and detects prediction drift.
+Checks SageMaker endpoint health, API endpoint health (via API Gateway),
+runs smoke tests, and detects prediction drift.
 """
 
 import sys
@@ -20,8 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mlops.config_mlops import (
     MLFLOW_TRACKING_URI,
     AWS_REGION,
-    ECS_CLUSTER,
-    ECS_SERVICE,
+    SAGEMAKER_ENDPOINT_NAME,
     API_BASE_URL,
     MONITOR_INTERVAL_SECONDS,
 )
@@ -38,33 +37,26 @@ SMOKE_SAFE = (
 )
 
 
-def check_ecs_health() -> Dict:
-    """Check ECS service health via AWS API."""
-    ecs = boto3.client("ecs", region_name=AWS_REGION)
+def check_sagemaker_endpoint_health() -> Dict:
+    """Check SageMaker endpoint health via AWS API."""
+    sm = boto3.client("sagemaker", region_name=AWS_REGION)
 
     try:
-        response = ecs.describe_services(
-            cluster=ECS_CLUSTER, services=[ECS_SERVICE]
-        )
-
-        if not response["services"]:
-            return {"status": "NOT_FOUND", "message": "Service not found"}
-
-        svc = response["services"][0]
+        response = sm.describe_endpoint(EndpointName=SAGEMAKER_ENDPOINT_NAME)
+        status = response["EndpointStatus"]
         return {
-            "status": svc["status"],
-            "running_count": svc["runningCount"],
-            "desired_count": svc["desiredCount"],
-            "pending_count": svc["pendingCount"],
-            "task_definition": svc["taskDefinition"],
-            "healthy": svc["runningCount"] == svc["desiredCount"] and svc["runningCount"] > 0,
+            "endpoint_name": SAGEMAKER_ENDPOINT_NAME,
+            "status": status,
+            "healthy": status == "InService",
+            "creation_time": str(response.get("CreationTime", "")),
+            "last_modified": str(response.get("LastModifiedTime", "")),
         }
     except Exception as e:
         return {"status": "ERROR", "message": str(e), "healthy": False}
 
 
 def check_endpoint_health(base_url: Optional[str] = None) -> Dict:
-    """Check the /health endpoint of the deployed API."""
+    """Check the /health endpoint of the deployed API (via API Gateway)."""
     url = (base_url or API_BASE_URL).rstrip("/") + "/health"
 
     try:
@@ -133,12 +125,10 @@ def check_prediction_drift(
     """
     url = (base_url or API_BASE_URL).rstrip("/") + "/predict"
 
-    # Load test samples
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from data_loader import load_and_preprocess
 
     texts, labels = load_and_preprocess()
-    # Take a sample from the end (test-like portion)
     sample_texts = texts[-n_samples:]
     sample_labels = labels[-n_samples:]
 
@@ -196,26 +186,22 @@ def log_metrics_to_mlflow(metrics: Dict):
 
 def run_all_checks(
     base_url: Optional[str] = None,
-    skip_ecs: bool = False,
     skip_drift: bool = False,
 ) -> Dict:
     """Run all monitoring checks and return combined results."""
     results = {}
 
-    # ECS health
-    if not skip_ecs:
-        logger.info("Checking ECS service health...")
-        results["ecs"] = check_ecs_health()
-        status = "HEALTHY" if results["ecs"].get("healthy") else "UNHEALTHY"
-        logger.info("ECS: {} (running={}/{})", status,
-                     results["ecs"].get("running_count", "?"),
-                     results["ecs"].get("desired_count", "?"))
+    # SageMaker endpoint health
+    logger.info("Checking SageMaker endpoint health...")
+    results["sagemaker"] = check_sagemaker_endpoint_health()
+    status = "HEALTHY" if results["sagemaker"].get("healthy") else "UNHEALTHY"
+    logger.info("SageMaker endpoint: {} (status={})", status, results["sagemaker"].get("status"))
 
-    # Endpoint health
+    # API Gateway / HTTP endpoint health
     logger.info("Checking API endpoint health...")
     results["endpoint"] = check_endpoint_health(base_url)
     status = "HEALTHY" if results["endpoint"].get("healthy") else "UNHEALTHY"
-    logger.info("Endpoint: {}", status)
+    logger.info("API endpoint: {}", status)
 
     # Smoke tests
     if results["endpoint"].get("healthy"):
@@ -249,7 +235,8 @@ def run_all_checks(
 
     # Overall health
     results["overall_healthy"] = (
-        results.get("endpoint", {}).get("healthy", False)
+        results.get("sagemaker", {}).get("healthy", False)
+        and results.get("endpoint", {}).get("healthy", False)
         and results.get("smoke", {}).get("all_passed", False)
         and not results.get("drift", {}).get("drift_alert", False)
     )

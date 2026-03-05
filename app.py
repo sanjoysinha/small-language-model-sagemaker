@@ -49,6 +49,10 @@ class HealthResponse(BaseModel):
     onnx_path: str
 
 
+class PingResponse(BaseModel):
+    status: str
+
+
 # ──────────────────────────────────────────────
 # Application Lifecycle
 # ──────────────────────────────────────────────
@@ -79,6 +83,14 @@ app = FastAPI(
 # ──────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────
+
+@app.get("/ping", response_model=PingResponse)
+async def ping():
+    """SageMaker health check endpoint. Returns 200 when model is ready."""
+    if not detector:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    return PingResponse(status="healthy")
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -127,6 +139,20 @@ async def predict_batch(request: BatchEmailRequest):
         )
 
 
+@app.post("/invocations", response_model=EmailResponse)
+async def invocations(request: EmailRequest):
+    """SageMaker inference endpoint. Accepts same payload as /predict."""
+    if not detector:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    try:
+        result = detector.predict(request.email_text)
+        return EmailResponse(**result)
+    except Exception as e:
+        logger.exception("SageMaker invocation failed")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)

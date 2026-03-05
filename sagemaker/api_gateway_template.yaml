@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  API Gateway + Lambda proxy for the Phishing Email Detector SageMaker endpoint.
+  Deploy this ONCE to create the public API surface. The CI/CD pipeline only
+  updates the SageMaker endpoint itself — this stack does not need redeployment.
+
+  Deploy with:
+    aws cloudformation deploy \
+      --template-file sagemaker/api_gateway_template.yaml \
+      --stack-name phishing-detector-api \
+      --parameter-overrides SageMakerEndpointName=phishing-detector \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --region us-east-1
+
+Parameters:
+  SageMakerEndpointName:
+    Type: String
+    Default: phishing-detector
+    Description: Name of the SageMaker Real-Time Endpoint
+
+  LambdaFunctionName:
+    Type: String
+    Default: phishing-detector-proxy
+    Description: Name of the Lambda proxy function
+
+  ApiName:
+    Type: String
+    Default: phishing-detector-api
+    Description: Name of the API Gateway HTTP API
+
+Resources:
+
+  # ──────────────────────────────────────────────
+  # IAM Role for Lambda
+  # ──────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:DescribeEndpoint
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}"
+
+  # ──────────────────────────────────────────────
+  # Lambda Function (proxy)
+  # ──────────────────────────────────────────────
+  ProxyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+      Code:
+        ZipFile: |
+          import json, os, boto3
+
+          ENDPOINT_NAME = os.environ["SAGEMAKER_ENDPOINT_NAME"]
+          sm_runtime = boto3.client("sagemaker-runtime")
+          sm = boto3.client("sagemaker")
+
+          def lambda_handler(event, context):
+              path = event.get("rawPath", event.get("path", "/"))
+              method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+              body = event.get("body", "{}")
+
+              if method == "GET" and path in ("/health", "/ping"):
+                  return _health_response()
+              if method == "POST" and path in ("/predict", "/invocations"):
+                  return _invoke_endpoint(body)
+              if method == "POST" and path == "/predict/batch":
+                  return _invoke_endpoint(body)
+              return {"statusCode": 404, "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"error": f"Route not found: {method} {path}"})}
+
+          def _health_response():
+              try:
+                  resp = sm.describe_endpoint(EndpointName=ENDPOINT_NAME)
+                  status = resp["EndpointStatus"]
+                  ok = status == "InService"
+                  return {"statusCode": 200 if ok else 503,
+                          "headers": {"Content-Type": "application/json"},
+                          "body": json.dumps({"status": "healthy" if ok else status,
+                                              "is_ready": ok, "endpoint_name": ENDPOINT_NAME})}
+              except Exception as e:
+                  return {"statusCode": 503, "headers": {"Content-Type": "application/json"},
+                          "body": json.dumps({"status": "error", "message": str(e)})}
+
+          def _invoke_endpoint(body):
+              try:
+                  resp = sm_runtime.invoke_endpoint(EndpointName=ENDPOINT_NAME,
+                      ContentType="application/json", Accept="application/json",
+                      Body=body if isinstance(body, bytes) else body.encode("utf-8"))
+                  result = resp["Body"].read().decode("utf-8")
+                  return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": result}
+              except Exception as e:
+                  return {"statusCode": 502, "headers": {"Content-Type": "application/json"},
+                          "body": json.dumps({"error": str(e)})}
+
+  # Permission for API Gateway to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProxyLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # ──────────────────────────────────────────────
+  # API Gateway HTTP API
+  # ──────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref ApiName
+      ProtocolType: HTTP
+      Description: Public API for the Phishing Email Detector SageMaker endpoint
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ProxyLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Routes
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /health
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RoutePing:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /ping
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RoutePredict:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /predict
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RoutePredictBatch:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /predict/batch
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  RouteInvocations:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /invocations
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+
+Outputs:
+  ApiGatewayUrl:
+    Description: >
+      Public API Gateway URL. Set this as the API_BASE_URL GitHub secret
+      and as the API_BASE_URL environment variable for monitoring.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: PhishingDetectorApiUrl
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda proxy function
+    Value: !GetAtt ProxyLambda.Arn
+
+  HttpApiId:
+    Description: API Gateway HTTP API ID
+    Value: !Ref HttpApi

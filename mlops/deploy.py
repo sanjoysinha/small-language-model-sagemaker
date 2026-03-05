@@ -1,12 +1,15 @@
 """
-AWS deployment automation.
+AWS SageMaker deployment automation.
 
-Downloads the Production model from MLflow registry, builds a Docker image,
-pushes to ECR, and updates the ECS service with a rolling deployment.
+Downloads the Production model from MLflow registry, packages it as model.tar.gz,
+uploads to S3, builds a Docker image, pushes to ECR, and deploys a SageMaker
+Real-Time Endpoint.
 """
 
 import subprocess
 import sys
+import tarfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,13 +27,11 @@ from mlops.config_mlops import (
     AWS_REGION,
     ECR_REGISTRY,
     ECR_REPO,
-    ECS_CLUSTER,
-    ECS_SERVICE,
-    ECS_TASK_FAMILY,
-    CONTAINER_NAME,
-    ECS_TASK_CPU,
-    ECS_TASK_MEMORY,
-    ECS_EXECUTION_ROLE_ARN,
+    S3_ARTIFACT_BUCKET,
+    SAGEMAKER_EXECUTION_ROLE_ARN,
+    SAGEMAKER_ENDPOINT_NAME,
+    SAGEMAKER_MODEL_NAME,
+    SAGEMAKER_INSTANCE_TYPE,
 )
 
 
@@ -52,22 +53,17 @@ def download_production_model() -> str:
 
     logger.info("Downloading champion model: version={}, run_id={}", mv.version, mv.run_id)
 
-    # Download tokenizer + model files
     local_path = mlflow.artifacts.download_artifacts(
         run_id=mv.run_id, artifact_path="model_files"
     )
 
-    # Copy to the expected model directory for Docker build
     model_dir = config.MODEL_DIR
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy all files from downloaded artifacts to model dir
     import shutil
-    # Clear existing model files
     for item in model_dir.iterdir():
         if item.is_file():
             item.unlink()
-    # Copy new files
     src = Path(local_path)
     for item in src.iterdir():
         if item.is_file():
@@ -75,6 +71,43 @@ def download_production_model() -> str:
 
     logger.info("Production model saved to {}", model_dir)
     return str(model_dir)
+
+
+def package_model_for_sagemaker(model_dir: str) -> str:
+    """
+    Package model files into model.tar.gz for SageMaker.
+
+    SageMaker extracts this archive to /opt/ml/model inside the container.
+    Returns the path to the created archive.
+    """
+    model_dir = Path(model_dir)
+    tar_path = model_dir.parent / "model.tar.gz"
+
+    logger.info("Packaging model artifacts from {} -> {}", model_dir, tar_path)
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for f in model_dir.iterdir():
+            if f.is_file():
+                tar.add(f, arcname=f.name)
+
+    logger.info("Model packaged: {} ({:.1f} MB)", tar_path, tar_path.stat().st_size / 1e6)
+    return str(tar_path)
+
+
+def upload_model_to_s3(local_tar_path: str, tag: str) -> str:
+    """
+    Upload model.tar.gz to S3.
+
+    Returns the S3 URI (s3://bucket/key).
+    """
+    s3_key = f"sagemaker/models/{tag}/model.tar.gz"
+    s3 = boto3.client("s3", region_name=AWS_REGION)
+
+    logger.info("Uploading model to s3://{}/{}", S3_ARTIFACT_BUCKET, s3_key)
+    s3.upload_file(local_tar_path, S3_ARTIFACT_BUCKET, s3_key)
+
+    s3_uri = f"s3://{S3_ARTIFACT_BUCKET}/{s3_key}"
+    logger.info("Model uploaded: {}", s3_uri)
+    return s3_uri
 
 
 def build_and_push_image(tag: str) -> str:
@@ -89,7 +122,6 @@ def build_and_push_image(tag: str) -> str:
     image_uri = f"{ECR_REGISTRY}/{ECR_REPO}:{tag}"
     project_root = Path(__file__).parent.parent
 
-    # ECR login
     logger.info("Logging in to ECR...")
     login_cmd = (
         f"aws ecr get-login-password --region {AWS_REGION} | "
@@ -97,14 +129,12 @@ def build_and_push_image(tag: str) -> str:
     )
     _run_cmd(login_cmd, shell=True)
 
-    # Build for amd64 (Fargate)
     logger.info("Building Docker image: {}", image_uri)
     _run_cmd(
         f"docker buildx build --platform linux/amd64 -t {image_uri} {project_root}",
         shell=True,
     )
 
-    # Push
     logger.info("Pushing image to ECR...")
     _run_cmd(f"docker push {image_uri}", shell=True)
 
@@ -112,138 +142,178 @@ def build_and_push_image(tag: str) -> str:
     return image_uri
 
 
-def update_ecs_service(image_uri: str) -> str:
+def create_sagemaker_model(
+    model_name: str,
+    image_uri: str,
+    model_data_url: str,
+) -> str:
     """
-    Register a new ECS task definition and update the service.
+    Create a SageMaker Model resource.
 
-    Returns the new task definition ARN.
+    Deletes any existing model with the same name first.
+    Returns the model ARN.
     """
-    ecs = boto3.client("ecs", region_name=AWS_REGION)
+    if not SAGEMAKER_EXECUTION_ROLE_ARN:
+        raise RuntimeError("SAGEMAKER_EXECUTION_ROLE_ARN env var not set")
 
-    # Register new task definition
-    logger.info("Registering new task definition...")
-    response = ecs.register_task_definition(
-        family=ECS_TASK_FAMILY,
-        networkMode="awsvpc",
-        requiresCompatibilities=["FARGATE"],
-        cpu=ECS_TASK_CPU,
-        memory=ECS_TASK_MEMORY,
-        executionRoleArn=ECS_EXECUTION_ROLE_ARN,
-        containerDefinitions=[
+    sm = boto3.client("sagemaker", region_name=AWS_REGION)
+
+    # Delete existing model with same name (idempotent)
+    try:
+        sm.delete_model(ModelName=model_name)
+        logger.info("Deleted existing SageMaker model: {}", model_name)
+    except sm.exceptions.ClientError:
+        pass
+
+    logger.info("Creating SageMaker model: {}", model_name)
+    response = sm.create_model(
+        ModelName=model_name,
+        PrimaryContainer={
+            "Image": image_uri,
+            "ModelDataUrl": model_data_url,
+        },
+        ExecutionRoleArn=SAGEMAKER_EXECUTION_ROLE_ARN,
+    )
+
+    model_arn = response["ModelArn"]
+    logger.info("SageMaker model created: {}", model_arn)
+    return model_arn
+
+
+def deploy_sagemaker_endpoint(
+    model_name: str,
+    endpoint_name: str,
+    instance_type: str,
+) -> str:
+    """
+    Create or update a SageMaker Real-Time Endpoint.
+
+    Creates a new EndpointConfig, then creates or updates the endpoint.
+    Waits for the endpoint to reach InService status.
+    Returns the endpoint name.
+    """
+    sm = boto3.client("sagemaker", region_name=AWS_REGION)
+    endpoint_config_name = f"{endpoint_name}-config-{int(time.time())}"
+
+    logger.info("Creating EndpointConfig: {}", endpoint_config_name)
+    sm.create_endpoint_config(
+        EndpointConfigName=endpoint_config_name,
+        ProductionVariants=[
             {
-                "name": CONTAINER_NAME,
-                "image": image_uri,
-                "portMappings": [
-                    {"containerPort": 8000, "protocol": "tcp"}
-                ],
-                "essential": True,
-                "logConfiguration": {
-                    "logDriver": "awslogs",
-                    "options": {
-                        "awslogs-group": f"/ecs/{ECS_TASK_FAMILY}",
-                        "awslogs-region": AWS_REGION,
-                        "awslogs-stream-prefix": "ecs",
-                    },
-                },
+                "VariantName": "primary",
+                "ModelName": model_name,
+                "InstanceType": instance_type,
+                "InitialInstanceCount": 1,
             }
         ],
     )
 
-    task_def_arn = response["taskDefinition"]["taskDefinitionArn"]
-    logger.info("New task definition: {}", task_def_arn)
+    # Check if endpoint already exists → update, else create
+    try:
+        sm.describe_endpoint(EndpointName=endpoint_name)
+        logger.info("Updating existing endpoint: {}", endpoint_name)
+        sm.update_endpoint(
+            EndpointName=endpoint_name,
+            EndpointConfigName=endpoint_config_name,
+        )
+    except sm.exceptions.ClientError:
+        logger.info("Creating new endpoint: {}", endpoint_name)
+        sm.create_endpoint(
+            EndpointName=endpoint_name,
+            EndpointConfigName=endpoint_config_name,
+        )
 
-    # Update service
-    logger.info("Updating ECS service...")
-    ecs.update_service(
-        cluster=ECS_CLUSTER,
-        service=ECS_SERVICE,
-        taskDefinition=task_def_arn,
-        forceNewDeployment=True,
-    )
-
-    # Wait for deployment to stabilize
-    logger.info("Waiting for deployment to stabilize...")
-    waiter = ecs.get_waiter("services_stable")
+    logger.info("Waiting for endpoint to reach InService status...")
+    waiter = sm.get_waiter("endpoint_in_service")
     try:
         waiter.wait(
-            cluster=ECS_CLUSTER,
-            services=[ECS_SERVICE],
-            WaiterConfig={"Delay": 15, "MaxAttempts": 40},
+            EndpointName=endpoint_name,
+            WaiterConfig={"Delay": 30, "MaxAttempts": 40},
         )
-        logger.info("Deployment stabilized successfully")
+        logger.info("Endpoint is InService: {}", endpoint_name)
     except Exception as e:
-        logger.error("Deployment did not stabilize: {}", e)
+        logger.error("Endpoint did not reach InService: {}", e)
         raise
 
-    return task_def_arn
+    return endpoint_name
 
 
-def rollback(previous_task_def_arn: str):
-    """Roll back ECS service to a previous task definition."""
-    ecs = boto3.client("ecs", region_name=AWS_REGION)
+def rollback(previous_endpoint_config: Optional[str]):
+    """Roll back SageMaker endpoint to a previous EndpointConfig."""
+    if not previous_endpoint_config:
+        logger.warning("No previous EndpointConfig available for rollback")
+        return
 
-    logger.warning("Rolling back to: {}", previous_task_def_arn)
-    ecs.update_service(
-        cluster=ECS_CLUSTER,
-        service=ECS_SERVICE,
-        taskDefinition=previous_task_def_arn,
-        forceNewDeployment=True,
+    sm = boto3.client("sagemaker", region_name=AWS_REGION)
+    logger.warning("Rolling back to EndpointConfig: {}", previous_endpoint_config)
+    sm.update_endpoint(
+        EndpointName=SAGEMAKER_ENDPOINT_NAME,
+        EndpointConfigName=previous_endpoint_config,
     )
 
     logger.info("Waiting for rollback to stabilize...")
-    waiter = ecs.get_waiter("services_stable")
+    waiter = sm.get_waiter("endpoint_in_service")
     waiter.wait(
-        cluster=ECS_CLUSTER,
-        services=[ECS_SERVICE],
-        WaiterConfig={"Delay": 15, "MaxAttempts": 40},
+        EndpointName=SAGEMAKER_ENDPOINT_NAME,
+        WaiterConfig={"Delay": 30, "MaxAttempts": 40},
     )
     logger.info("Rollback complete")
 
 
-def get_current_task_def() -> Optional[str]:
-    """Get the current task definition ARN for the ECS service."""
-    ecs = boto3.client("ecs", region_name=AWS_REGION)
+def get_current_endpoint_config() -> Optional[str]:
+    """Get the current EndpointConfig name for the SageMaker endpoint."""
+    sm = boto3.client("sagemaker", region_name=AWS_REGION)
     try:
-        response = ecs.describe_services(
-            cluster=ECS_CLUSTER, services=[ECS_SERVICE]
-        )
-        if response["services"]:
-            return response["services"][0]["taskDefinition"]
+        response = sm.describe_endpoint(EndpointName=SAGEMAKER_ENDPOINT_NAME)
+        return response.get("EndpointConfigName")
     except Exception:
-        pass
-    return None
+        return None
 
 
-def deploy(tag: str):
+def deploy(tag: str) -> str:
     """
-    Full deployment pipeline:
+    Full SageMaker deployment pipeline:
     1. Download Production model from MLflow
-    2. Build and push Docker image
-    3. Update ECS service
+    2. Package model as model.tar.gz
+    3. Upload model artifact to S3
+    4. Build and push Docker image to ECR
+    5. Create SageMaker Model
+    6. Create/update SageMaker Endpoint
+
+    Returns the endpoint name.
     """
-    # Save current task def for rollback
-    previous_task_def = get_current_task_def()
-    if previous_task_def:
-        logger.info("Current task definition (for rollback): {}", previous_task_def)
+    previous_endpoint_config = get_current_endpoint_config()
+    if previous_endpoint_config:
+        logger.info("Current EndpointConfig (for rollback): {}", previous_endpoint_config)
 
     # Step 1: Download production model
-    download_production_model()
+    model_dir = download_production_model()
 
-    # Step 2: Build and push
+    # Step 2: Package model
+    tar_path = package_model_for_sagemaker(model_dir)
+
+    # Step 3: Upload to S3
+    model_data_url = upload_model_to_s3(tar_path, tag)
+
+    # Step 4: Build and push Docker image
     image_uri = build_and_push_image(tag)
 
-    # Step 3: Update ECS
+    # Step 5: Create SageMaker Model
+    sagemaker_model_name = f"{SAGEMAKER_MODEL_NAME}-{tag}"
+    create_sagemaker_model(sagemaker_model_name, image_uri, model_data_url)
+
+    # Step 6: Deploy endpoint
     try:
-        new_task_def = update_ecs_service(image_uri)
-        logger.info("Deployment successful! Task definition: {}", new_task_def)
+        deploy_sagemaker_endpoint(sagemaker_model_name, SAGEMAKER_ENDPOINT_NAME, SAGEMAKER_INSTANCE_TYPE)
+        logger.info("Deployment successful! Endpoint: {}", SAGEMAKER_ENDPOINT_NAME)
     except Exception as e:
         logger.error("Deployment failed: {}", e)
-        if previous_task_def:
+        if previous_endpoint_config:
             logger.info("Attempting rollback...")
-            rollback(previous_task_def)
+            rollback(previous_endpoint_config)
         raise
 
-    return image_uri
+    return SAGEMAKER_ENDPOINT_NAME
 
 
 def _run_cmd(cmd: str, shell: bool = False):
@@ -264,8 +334,8 @@ def _run_cmd(cmd: str, shell: bool = False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Deploy to AWS ECS")
-    parser.add_argument("--tag", required=True, help="Docker image tag")
+    parser = argparse.ArgumentParser(description="Deploy to AWS SageMaker")
+    parser.add_argument("--tag", required=True, help="Docker image tag / deployment version")
     args = parser.parse_args()
 
     deploy(args.tag)

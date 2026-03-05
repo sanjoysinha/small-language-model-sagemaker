@@ -4,7 +4,12 @@ from pathlib import Path
 # Paths
 # ──────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent
-MODEL_DIR = PROJECT_ROOT / "models" / "distilbert-phishing"
+
+# SageMaker injects model artifacts to /opt/ml/model at runtime.
+# Fall back to local path for development.
+_SM_MODEL_DIR = Path("/opt/ml/model")
+MODEL_DIR = _SM_MODEL_DIR if _SM_MODEL_DIR.exists() else PROJECT_ROOT / "models" / "distilbert-phishing"
+
 ONNX_DIR = PROJECT_ROOT / "models" / "onnx"
 LOG_DIR = PROJECT_ROOT / "logs"
 

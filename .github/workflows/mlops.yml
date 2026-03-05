@@ -12,6 +12,7 @@ on:
       - 'app.py'
       - 'requirements.txt'
       - 'Dockerfile'
+      - 'lambda/**'
       - '.github/workflows/**'
 
   schedule:
@@ -38,10 +39,10 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
   ECR_REPO: ${{ secrets.ECR_REPO }}
-  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
-  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
-  ECS_TASK_FAMILY: ${{ secrets.ECS_TASK_FAMILY }}
-  ECS_EXECUTION_ROLE_ARN: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+  S3_ARTIFACT_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
+  SAGEMAKER_EXECUTION_ROLE_ARN: ${{ secrets.SAGEMAKER_EXECUTION_ROLE_ARN }}
+  SAGEMAKER_ENDPOINT_NAME: ${{ secrets.SAGEMAKER_ENDPOINT_NAME }}
+  SAGEMAKER_INSTANCE_TYPE: ${{ secrets.SAGEMAKER_INSTANCE_TYPE }}
 
 jobs:
   lint:
@@ -119,7 +120,7 @@ jobs:
         run: python -m mlops.pipeline evaluate --model-dir models/distilbert-phishing
 
   deploy:
-    name: Deploy to ECS
+    name: Deploy to SageMaker
     needs: evaluate
     if: needs.evaluate.result == 'success'
     runs-on: ubuntu-latest
@@ -152,63 +153,69 @@ jobs:
         run: |
           aws s3 cp s3://${{ secrets.S3_ARTIFACT_BUCKET }}/production-model/ models/distilbert-phishing/ --recursive
 
-      - name: Upload model to S3 (for future deploys)
+      - name: Upload model to S3 (production snapshot)
         run: |
           aws s3 sync models/distilbert-phishing/ s3://${{ secrets.S3_ARTIFACT_BUCKET }}/production-model/ --delete
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
+      - name: Build and push Docker image to ECR
         run: |
           IMAGE_URI="${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPO }}:${{ github.sha }}"
           docker buildx build --platform linux/amd64 -t $IMAGE_URI .
           docker push $IMAGE_URI
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      - name: Update ECS task definition and service
+      - name: Package model as model.tar.gz
         run: |
-          # Register new task definition
-          TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --family ${{ secrets.ECS_TASK_FAMILY }} \
-            --network-mode awsvpc \
-            --requires-compatibilities FARGATE \
-            --cpu 1024 \
-            --memory 2048 \
-            --execution-role-arn ${{ secrets.ECS_EXECUTION_ROLE_ARN }} \
-            --container-definitions '[{
-              "name": "phishing-detector",
-              "image": "'$IMAGE_URI'",
-              "portMappings": [{"containerPort": 8000, "protocol": "tcp"}],
-              "essential": true,
-              "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                  "awslogs-group": "/ecs/phishing-task",
-                  "awslogs-region": "${{ secrets.AWS_REGION }}",
-                  "awslogs-stream-prefix": "ecs"
-                }
-              }
-            }]' \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
+          tar -czf model.tar.gz -C models/distilbert-phishing .
+          echo "Model archive size: $(du -sh model.tar.gz | cut -f1)"
 
-          echo "New task definition: $TASK_DEF_ARN"
+      - name: Upload model.tar.gz to S3
+        run: |
+          S3_KEY="sagemaker/models/${{ github.sha }}/model.tar.gz"
+          aws s3 cp model.tar.gz s3://${{ secrets.S3_ARTIFACT_BUCKET }}/$S3_KEY
+          echo "MODEL_DATA_URL=s3://${{ secrets.S3_ARTIFACT_BUCKET }}/$S3_KEY" >> $GITHUB_ENV
 
-          # Update service
-          aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition $TASK_DEF_ARN \
-            --force-new-deployment
+      - name: Create SageMaker Model
+        run: |
+          SM_MODEL_NAME="phishing-distilbert-${{ github.sha }}"
+          aws sagemaker create-model \
+            --model-name $SM_MODEL_NAME \
+            --primary-container \
+              Image=${{ env.IMAGE_URI }},ModelDataUrl=${{ env.MODEL_DATA_URL }} \
+            --execution-role-arn ${{ secrets.SAGEMAKER_EXECUTION_ROLE_ARN }}
+          echo "SM_MODEL_NAME=$SM_MODEL_NAME" >> $GITHUB_ENV
 
-          # Wait for stability
-          echo "Waiting for deployment to stabilize..."
-          aws ecs wait services-stable \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }}
+      - name: Create SageMaker EndpointConfig
+        run: |
+          CONFIG_NAME="${{ secrets.SAGEMAKER_ENDPOINT_NAME }}-config-$(date +%s)"
+          aws sagemaker create-endpoint-config \
+            --endpoint-config-name $CONFIG_NAME \
+            --production-variants \
+              VariantName=primary,ModelName=${{ env.SM_MODEL_NAME }},InstanceType=${{ secrets.SAGEMAKER_INSTANCE_TYPE }},InitialInstanceCount=1
+          echo "ENDPOINT_CONFIG_NAME=$CONFIG_NAME" >> $GITHUB_ENV
 
-          echo "Deployment complete!"
+      - name: Create or Update SageMaker Endpoint
+        run: |
+          ENDPOINT_NAME="${{ secrets.SAGEMAKER_ENDPOINT_NAME }}"
+          # Check if endpoint already exists
+          if aws sagemaker describe-endpoint --endpoint-name $ENDPOINT_NAME 2>/dev/null; then
+            echo "Updating existing endpoint..."
+            aws sagemaker update-endpoint \
+              --endpoint-name $ENDPOINT_NAME \
+              --endpoint-config-name ${{ env.ENDPOINT_CONFIG_NAME }}
+          else
+            echo "Creating new endpoint..."
+            aws sagemaker create-endpoint \
+              --endpoint-name $ENDPOINT_NAME \
+              --endpoint-config-name ${{ env.ENDPOINT_CONFIG_NAME }}
+          fi
+
+          echo "Waiting for endpoint to reach InService status..."
+          aws sagemaker wait endpoint-in-service --endpoint-name $ENDPOINT_NAME
+          echo "Endpoint is InService: $ENDPOINT_NAME"
 
   post-deploy:
     name: Post-Deploy Monitoring
@@ -225,10 +232,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Wait for service to stabilize
-        run: sleep 60
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Wait for API Gateway propagation
+        run: sleep 30
 
       - name: Run post-deploy health checks
         env:
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          SAGEMAKER_ENDPOINT_NAME: ${{ secrets.SAGEMAKER_ENDPOINT_NAME }}
         run: python -m mlops.pipeline monitor --once --url $API_BASE_URL

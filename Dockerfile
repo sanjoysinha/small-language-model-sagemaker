@@ -9,12 +9,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY config.py data_loader.py inference.py app.py ./
 
-# Copy fine-tuned model artifacts
-COPY models/distilbert-phishing/ ./models/distilbert-phishing/
+# SageMaker injects model artifacts to /opt/ml/model at runtime.
+# For local testing, mount your model directory to /opt/ml/model:
+#   docker run -v ./models/distilbert-phishing:/opt/ml/model -p 8080:8080 <image>
 
-EXPOSE 8000
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')" || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"]

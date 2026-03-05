@@ -4,10 +4,10 @@ MLOps pipeline CLI orchestrator.
 Usage:
     python -m mlops.pipeline train           # MLflow-tracked training + register to Staging
     python -m mlops.pipeline evaluate        # Evaluation gate: Staging vs Production
-    python -m mlops.pipeline deploy --tag v1 # Build/push/deploy Production model
+    python -m mlops.pipeline deploy --tag v1 # Build/push/deploy Production model to SageMaker
     python -m mlops.pipeline promote --version 3  # Manually promote a version to Production
     python -m mlops.pipeline monitor [--once]     # Health + smoke tests
-    python -m mlops.pipeline status               # Show registry state + ECS status
+    python -m mlops.pipeline status               # Show registry state + SageMaker status
 """
 
 import argparse
@@ -53,12 +53,12 @@ def cmd_evaluate(args):
 
 
 def cmd_deploy(args):
-    """Deploy to AWS ECS."""
+    """Deploy to AWS SageMaker."""
     from mlops.deploy import deploy
 
-    logger.info("Starting deployment with tag '{}'...", args.tag)
-    image_uri = deploy(args.tag)
-    logger.info("Deployment complete: {}", image_uri)
+    logger.info("Starting SageMaker deployment with tag '{}'...", args.tag)
+    endpoint_name = deploy(args.tag)
+    logger.info("Deployment complete. Endpoint: {}", endpoint_name)
 
 
 def cmd_promote(args):
@@ -140,27 +140,27 @@ def cmd_status(args):
     except mlflow.exceptions.MlflowException:
         logger.info("Model '{}' not found in registry", MLFLOW_REGISTRY_MODEL_NAME)
 
-    # ECS status
+    # SageMaker status
     logger.info("")
     logger.info("=" * 60)
-    logger.info("ECS Service Status")
+    logger.info("SageMaker Endpoint Status")
     logger.info("=" * 60)
 
     try:
-        from mlops.monitor import check_ecs_health
-        ecs_status = check_ecs_health()
-        if ecs_status.get("status") == "ERROR" and "ClusterNotFoundException" in ecs_status.get("message", ""):
-            logger.info("  No ECS cluster deployed (AWS resources not provisioned)")
-        elif ecs_status.get("healthy"):
-            logger.info("  Status: HEALTHY (running={}/{})",
-                         ecs_status.get("running_count", "?"),
-                         ecs_status.get("desired_count", "?"))
-            logger.info("  Task definition: {}", ecs_status.get("task_definition", "?"))
+        from mlops.monitor import check_sagemaker_endpoint_health
+        sm_status = check_sagemaker_endpoint_health()
+        if sm_status.get("status") == "ERROR":
+            logger.info("  No SageMaker endpoint deployed ({})", sm_status.get("message", ""))
+        elif sm_status.get("healthy"):
+            logger.info("  Status: HEALTHY (InService)")
+            logger.info("  Endpoint: {}", sm_status.get("endpoint_name", "?"))
+            logger.info("  Last modified: {}", sm_status.get("last_modified", "?"))
         else:
-            for key, value in ecs_status.items():
+            logger.info("  Status: {} (not InService)", sm_status.get("status", "UNKNOWN"))
+            for key, value in sm_status.items():
                 logger.info("  {}: {}", key, value)
     except Exception as e:
-        logger.info("  ECS check unavailable: {}", e)
+        logger.info("  SageMaker check unavailable: {}", e)
 
 
 def main():
@@ -171,10 +171,10 @@ def main():
 Examples:
   python -m mlops.pipeline train              # Train with MLflow tracking
   python -m mlops.pipeline evaluate           # Run evaluation gate
-  python -m mlops.pipeline deploy --tag v1    # Deploy to ECS
+  python -m mlops.pipeline deploy --tag v1    # Deploy to SageMaker
   python -m mlops.pipeline promote --version 3  # Promote model version
   python -m mlops.pipeline monitor --once     # Run one health check
-  python -m mlops.pipeline status             # Show registry + ECS status
+  python -m mlops.pipeline status             # Show registry + SageMaker status
         """,
     )
 
@@ -191,7 +191,7 @@ Examples:
     )
 
     # deploy
-    deploy_parser = subparsers.add_parser("deploy", help="Deploy to AWS ECS")
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy to AWS SageMaker")
     deploy_parser.add_argument("--tag", required=True, help="Docker image tag")
 
     # promote
@@ -204,7 +204,7 @@ Examples:
     monitor_parser.add_argument("--url", type=str, default=None, help="API base URL")
 
     # status
-    subparsers.add_parser("status", help="Show registry + ECS status")
+    subparsers.add_parser("status", help="Show registry + SageMaker status")
 
     args = parser.parse_args()
 

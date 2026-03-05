@@ -14,28 +14,29 @@ MLFLOW_EXPERIMENT_NAME = os.getenv("MLFLOW_EXPERIMENT_NAME", "phishing-detector"
 MLFLOW_REGISTRY_MODEL_NAME = os.getenv("MLFLOW_REGISTRY_MODEL_NAME", "phishing-distilbert")
 
 # ──────────────────────────────────────────────
-# S3 artifact store (used when MLflow artifact URI is s3://)
+# S3 artifact store
 # ──────────────────────────────────────────────
 S3_ARTIFACT_BUCKET = os.getenv("S3_ARTIFACT_BUCKET", "phishing-mlops-artifacts")
 S3_ARTIFACT_PREFIX = os.getenv("S3_ARTIFACT_PREFIX", "mlflow-artifacts")
 
 # ──────────────────────────────────────────────
-# AWS - ECR
+# AWS - General
 # ──────────────────────────────────────────────
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# ──────────────────────────────────────────────
+# AWS - ECR (Docker image registry)
+# ──────────────────────────────────────────────
 ECR_REGISTRY = os.getenv("ECR_REGISTRY", "")  # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com
 ECR_REPO = os.getenv("ECR_REPO", "phishing-detector")
 
 # ──────────────────────────────────────────────
-# AWS - ECS
+# AWS - SageMaker
 # ──────────────────────────────────────────────
-ECS_CLUSTER = os.getenv("ECS_CLUSTER", "phishing-cluster")
-ECS_SERVICE = os.getenv("ECS_SERVICE", "phishing-service")
-ECS_TASK_FAMILY = os.getenv("ECS_TASK_FAMILY", "phishing-task")
-CONTAINER_NAME = os.getenv("CONTAINER_NAME", "phishing-detector")
-ECS_TASK_CPU = os.getenv("ECS_TASK_CPU", "1024")
-ECS_TASK_MEMORY = os.getenv("ECS_TASK_MEMORY", "2048")
-ECS_EXECUTION_ROLE_ARN = os.getenv("ECS_EXECUTION_ROLE_ARN", "")
+SAGEMAKER_EXECUTION_ROLE_ARN = os.getenv("SAGEMAKER_EXECUTION_ROLE_ARN", "")
+SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "phishing-detector")
+SAGEMAKER_MODEL_NAME = os.getenv("SAGEMAKER_MODEL_NAME", "phishing-distilbert")
+SAGEMAKER_INSTANCE_TYPE = os.getenv("SAGEMAKER_INSTANCE_TYPE", "ml.m5.large")
 
 # ──────────────────────────────────────────────
 # Evaluation gate thresholds
@@ -48,5 +49,5 @@ MIN_RECALL = float(os.getenv("MIN_RECALL", "0.93"))
 # ──────────────────────────────────────────────
 # Monitoring
 # ──────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8080")
 MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "300"))
