@@ -20,7 +20,19 @@ sm = boto3.client("sagemaker")
 
 
 def lambda_handler(event, context):
-    path = event.get("rawPath", event.get("path", "/"))
+    raw_path = event.get("rawPath", event.get("path", "/"))
+    stage = event.get("requestContext", {}).get("stage", "")
+
+    # Strip stage prefix — API Gateway includes it in rawPath
+    # e.g. /prod/health → /health
+    if stage and raw_path.startswith(f"/{stage}"):
+        path = raw_path[len(f"/{stage}"):]
+    else:
+        path = raw_path
+
+    if not path:
+        path = "/"
+
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
     body = event.get("body", "{}")
 
